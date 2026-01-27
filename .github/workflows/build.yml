@@ -1,0 +1,43 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest  # 关键：使用 GitHub 的 Windows 环境
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10" # 使用较新的 Python 版本，避免 3.7 的问题
+
+    - name: Install Dependencies
+      run: |
+        pip install -r requirements.txt
+        # 验证安装
+        python -c "import torch; print('Torch version:', torch.__version__)"
+
+    - name: Run PyInstaller (Packaging)
+      run: |
+        # --onefile: 打包成单文件
+        # --name: 指定 exe 名字
+        # --hidden-import: 显式导入隐式依赖，防止报错
+        pyinstaller --clean --onefile --name "DataGovernanceTool" ^
+          --hidden-import="sklearn.utils._cython_blas" ^
+          --hidden-import="sklearn.neighbors.typedefs" ^
+          --hidden-import="sklearn.neighbors.quad_tree" ^
+          --hidden-import="sklearn.tree._utils" ^
+          --hidden-import="sentence_transformers" ^
+          run_final_prod.py
+
+    - name: Upload EXE Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: DataGovernanceTool_EXE
+        path: dist/DataGovernanceTool.exe
