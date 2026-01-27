@@ -7,37 +7,36 @@ on:
 
 jobs:
   build:
-    # 1. 指定使用 Windows 环境
     runs-on: windows-latest
 
     steps:
     - name: Checkout Code
-      # 2. 修复报错：升级到 v4
       uses: actions/checkout@v4
 
     - name: Set up Python
-      # 3. 升级到 v5
       uses: actions/setup-python@v5
       with:
         python-version: "3.10" 
 
     - name: Install Dependencies
+      # 【关键点1】显式指定 cmd，这样 REM 注释和 ^ 符号才会被正确识别
+      shell: cmd
       run: |
         python -m pip install --upgrade pip
         
-        # 【优化】强制安装 CPU 版 PyTorch。
-        # 如果不加这行，它会下载带 CUDA 的版本，导致 exe 文件巨大无比且容易打包失败。
+        REM 安装 CPU 版 PyTorch (减小体积，避免下载 2GB 的 CUDA 包)
         pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
         
-        # 安装你的业务依赖
+        REM 安装你的业务依赖
         pip install pandas sentence-transformers huggingface_hub pyinstaller
         
-        # 验证一下
+        REM 验证安装
         python -c "import torch; print('Torch version:', torch.__version__)"
 
     - name: Run PyInstaller (Build EXE)
+      # 【关键点2】必须指定 shell: cmd，否则 Windows 默认用 PowerShell 会导致换行符报错
+      shell: cmd
       run: |
-        # Windows 下换行符是 ` (反引号) 或者 ^
         pyinstaller --clean --onefile --name "DataGovernanceTool" ^
           --hidden-import="sklearn.utils._cython_blas" ^
           --hidden-import="sklearn.neighbors.typedefs" ^
@@ -47,7 +46,6 @@ jobs:
           run_final_prod.py
 
     - name: Upload EXE Artifact
-      # 4. 修复报错：升级到 v4
       uses: actions/upload-artifact@v4
       with:
         name: DataGovernanceTool_Windows
