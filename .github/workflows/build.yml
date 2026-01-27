@@ -7,27 +7,37 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest  # 关键：使用 GitHub 的 Windows 环境
+    # 1. 指定使用 Windows 环境
+    runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v3
+    - name: Checkout Code
+      # 2. 修复报错：升级到 v4
+      uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      # 3. 升级到 v5
+      uses: actions/setup-python@v5
       with:
-        python-version: "3.10" # 使用较新的 Python 版本，避免 3.7 的问题
+        python-version: "3.10" 
 
     - name: Install Dependencies
       run: |
-        pip install -r requirements.txt
-        # 验证安装
+        python -m pip install --upgrade pip
+        
+        # 【优化】强制安装 CPU 版 PyTorch。
+        # 如果不加这行，它会下载带 CUDA 的版本，导致 exe 文件巨大无比且容易打包失败。
+        pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+        
+        # 安装你的业务依赖
+        pip install pandas sentence-transformers huggingface_hub pyinstaller
+        
+        # 验证一下
         python -c "import torch; print('Torch version:', torch.__version__)"
 
-    - name: Run PyInstaller (Packaging)
+    - name: Run PyInstaller (Build EXE)
       run: |
-        # --onefile: 打包成单文件
-        # --name: 指定 exe 名字
-        # --hidden-import: 显式导入隐式依赖，防止报错
+        # Windows 下换行符是 ` (反引号) 或者 ^
         pyinstaller --clean --onefile --name "DataGovernanceTool" ^
           --hidden-import="sklearn.utils._cython_blas" ^
           --hidden-import="sklearn.neighbors.typedefs" ^
@@ -37,7 +47,8 @@ jobs:
           run_final_prod.py
 
     - name: Upload EXE Artifact
-      uses: actions/upload-artifact@v3
+      # 4. 修复报错：升级到 v4
+      uses: actions/upload-artifact@v4
       with:
-        name: DataGovernanceTool_EXE
+        name: DataGovernanceTool_Windows
         path: dist/DataGovernanceTool.exe
