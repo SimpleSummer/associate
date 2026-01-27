@@ -1,0 +1,5 @@
+pandas
+sentence-transformers
+huggingface_hub
+torch --index-url https://download.pytorch.org/whl/cpu
+pyinstaller
