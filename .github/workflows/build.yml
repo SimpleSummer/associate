@@ -47,7 +47,7 @@ jobs:
           --hidden-import="sklearn.neighbors.quad_tree" ^
           --hidden-import="sklearn.tree._utils" ^
           --hidden-import="sentence_transformers" ^
-          run_final_official.py
+          run_final_prod.py
 
     - name: Create Release (Fast Download)
       uses: softprops/action-gh-release@v1
