@@ -1,31 +1,29 @@
+import os
+import shutil
+import sys
+import re
 import pandas as pd
+import torch
 from sentence_transformers import SentenceTransformer
 from huggingface_hub import snapshot_download
-import torch
-import re
-import os
-import sys
 
-# ================= 1. 全局配置区域 =================
-
-# 模型配置：多语言对齐模型 (CPU 友好，准确度高)
+# ================= 1. 全局参数配置 =================
+# 模型仓库名称 (多语言版 MiniLM)
 MODEL_REPO = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-LOCAL_MODEL_DIR = "./multilingual-minilm-local" 
+# 本地保存路径
+LOCAL_MODEL_DIR = "./multilingual-minilm-local"
 
-# 输入输出文件配置 (请根据实际文件名修改)
-# 建议使用 CSV 格式以支持 100万+ 行数据
-TABLE_FILE_IN = "tables_test.csv"        # 输入：表清单
-TABLE_FILE_OUT = "tables_result.csv"     # 输出：表清单结果
+# 输入输出文件配置
+TABLE_FILE_IN = "tables_test.csv"
+TABLE_FILE_OUT = "tables_result.csv"
+COLUMN_FILE_IN = "columns_test.csv"
+COLUMN_FILE_OUT = "columns_result.csv"
 
-COLUMN_FILE_IN = "columns_test.csv"      # 输入：列清单
-COLUMN_FILE_OUT = "columns_result.csv"   # 输出：列清单结果
-
-# 批处理大小 (根据服务器内存调整，CPU 建议 256-512)
+# 批处理大小 (根据内存调整)
 BATCH_SIZE = 512
 
-# ================= 2. 行业通用缩写/同义词典 =================
-# 策略：如果英文命中 Key，且中文命中 Value 中的任意一个，则给予额外加分。
-# 这解决了 "amt" (缩写) 和 "金额" (全称) 在纯语义模型中分值不够高的问题。
+# ================= 2. 行业专家词典 (规则引擎) =================
+# 作用：英文缩写命中 Key 且 中文包含 Value -> 强制加 25 分
 COMMON_SYNONYMS = {
     # --- 核心标识 ---
     'id':    ['编号', '代码', '标识', '序号', 'id'],
@@ -35,7 +33,7 @@ COMMON_SYNONYMS = {
     'nm':    ['名称', '姓名'],
     'name':  ['名称', '姓名'],
     
-    # --- 金额与交易 (金融核心) ---
+    # --- 金额与交易 ---
     'amt':   ['金额', '费用', '钱'],
     'amount':['金额', '数量'],
     'bal':   ['余额', '差额'],
@@ -46,7 +44,7 @@ COMMON_SYNONYMS = {
     'trans': ['交易', '传输'],
     'pay':   ['支付', '付款'],
     
-    # --- 常用实体 ---
+    # --- 组织与人员 ---
     'org':   ['机构', '组织', '部门'],
     'dept':  ['部门', '科室'],
     'cust':  ['客户'],
@@ -68,7 +66,7 @@ COMMON_SYNONYMS = {
     'is':    ['是否'],
     'curr':  ['币种', '当前'],
     
-    # --- 通用术语 ---
+    # --- 通用 ---
     'desc':  ['描述', '说明', '备注'],
     'rem':   ['备注', '摘要'],
     'remark':['备注', '摘要', '说明'],
@@ -80,163 +78,186 @@ COMMON_SYNONYMS = {
     'seq':   ['序号', '序列']
 }
 
-# ================= 3. 核心工具函数 =================
+# ================= 3. 智能下载与校验模块 =================
 
-def download_model_if_needed():
+def check_model_integrity():
     """
-    智能下载：只下载 PyTorch 权重文件，过滤掉 TF/ONNX 等无用大文件。
-    将下载量从 3GB+ 降低到 ~470MB。
+    检查模型核心文件是否存在。
+    适配 sentence-transformers 2.x 版本，必须检查 pytorch_model.bin
     """
+    # 必须包含: 权重文件, 主配置, 分词配置
+    required_files = ["pytorch_model.bin", "config.json", "tokenizer.json", "sentencepiece.bpe.model"]
+    
     if not os.path.exists(LOCAL_MODEL_DIR):
-        print(f"[{MODEL_REPO}] 本地模型不存在，开始下载...")
-        print("提示：正在过滤非必要文件，仅下载核心权重 (约 470MB)...")
+        return False
+    
+    # 简单的存在性检查
+    for f in required_files:
+        if not os.path.exists(os.path.join(LOCAL_MODEL_DIR, f)):
+            # 兼容性检查：有些文件可能在子目录，这里主要检查根目录关键文件
+            if f == "sentencepiece.bpe.model": continue 
+            return False
+    return True
+
+def download_model_smartly():
+    """
+    智能下载逻辑 (官方源 + 兼容旧版库)：
+    1. 连接 Hugging Face 官方服务器。
+    2. 下载 *.json (解决 1_Pooling/config.json 缺失报错)。
+    3. 下载 *.model (解决分词器报错)。
+    4. 下载 pytorch_model.bin (适配 sentence-transformers 2.2.2)。
+    """
+    if check_model_integrity():
+        print(f"✅ 检测到完整模型: {LOCAL_MODEL_DIR}，跳过下载。")
+        return
+
+    # 清理残损目录
+    if os.path.exists(LOCAL_MODEL_DIR):
+        print("⚠️ 检测到目录不完整，正在清理并重新下载...")
         try:
-            snapshot_download(
-                repo_id=MODEL_REPO, 
-                local_dir=LOCAL_MODEL_DIR,
-                # 严格过滤，只下这些后缀
-                allow_patterns=["*.json", "*.safetensors", "*.bin", "*.model", "*.txt", "*.md"]
-            )
-            print("✅ 下载完成。")
+            shutil.rmtree(LOCAL_MODEL_DIR)
         except Exception as e:
-            print(f"❌ 下载失败: {e}")
-            print("请检查网络，或尝试配置 HF_ENDPOINT 镜像源。")
-            sys.exit(1)
-    else:
-        print(f"✅ 检测到本地模型目录 {LOCAL_MODEL_DIR}，跳过下载。")
+            print(f"❌ 清理失败: {e} (请手动删除文件夹)")
+
+    print(f"⬇️ 正在从官方源下载模型: {MODEL_REPO} ...")
+    print("   (模式：仅下载 PyTorch 权重和必要配置，约 470MB)")
+    
+    try:
+        snapshot_download(
+            repo_id=MODEL_REPO, 
+            local_dir=LOCAL_MODEL_DIR,
+            # 【关键配置】
+            # 必须包含 *.json (为了下载子文件夹里的配置)
+            # 必须包含 pytorch_model.bin (兼容性最佳)
+            allow_patterns=[
+                "*.json", 
+                "*.txt", 
+                "*.model", 
+                "pytorch_model.bin", 
+                "README.md"
+            ],
+            # 坚决不下载这些大文件
+            ignore_patterns=["*.safetensors", "*.onnx", "*.h5", "openvino*", "*.msgpack"],
+            resume_download=True
+        )
+        print("✅ 下载成功！")
+    except Exception as e:
+        print(f"\n❌ 下载失败: {e}")
+        print("提示：官方源连接超时，请检查网络或代理设置。")
+        sys.exit(1)
+
+# ================= 4. 数据处理核心逻辑 =================
 
 def preprocess_text(text):
-    """
-    标准化清洗：将代码命名转换为自然语言。
-    例如: 'isDeleted' -> 'is deleted', 'user_id' -> 'user id'
-    """
+    """文本清洗：驼峰拆分、去符、转小写"""
     if pd.isna(text): return ""
     text = str(text)
-    # 替换常见分隔符
     text = text.replace('_', ' ').replace('-', ' ')
-    # 拆分驼峰命名 (在大写字母前加空格)
+    # 拆分驼峰 (e.g., 'isDeleted' -> 'is Deleted')
     text = re.sub(r'(?<!^)(?=[A-Z])', ' ', text)
-    # 转小写并去首尾空格
     return text.lower().strip()
 
-def check_synonym_bonus(en_text, cn_text):
-    """
-    规则引擎：检查是否命中行业缩写字典。
-    如果命中，返回奖励分 (25分)。
-    """
-    # 将英文拆分为单词列表 (例如 'cust_id' -> ['cust', 'id'])
+def get_synonym_bonus(en_text, cn_text):
+    """计算规则奖励分"""
     en_words = preprocess_text(en_text).split()
     cn_text = str(cn_text)
     
     for word in en_words:
-        # 如果这个单词在字典里
         if word in COMMON_SYNONYMS:
-            # 检查对应的中文关键词是否出现在中文名里
             for cn_keyword in COMMON_SYNONYMS[word]:
                 if cn_keyword in cn_text:
-                    # 命中！比如 found 'id' and '编号'
-                    return 25 
+                    return 25 # 命中规则，奖励 25 分
     return 0
 
-def calculate_and_fill(df, type_name, model):
-    """
-    主计算逻辑：去重 -> 向量化 -> 规则修正 -> 还原
-    """
-    print(f"\n正在处理 {type_name} (原始行数: {len(df)})...")
-    
+def process_file(file_in, file_out, type_name, model):
+    """通用文件处理流程：读取 -> 计算 -> 保存"""
+    if not os.path.exists(file_in):
+        print(f"⚠️ 跳过：找不到输入文件 {file_in}")
+        return
+
+    print(f"\n🚀 正在处理 {type_name} ...")
+    try:
+        df = pd.read_csv(file_in, dtype=str)
+    except Exception as e:
+        print(f"❌ 读取文件失败: {e}")
+        return
+
     if type_name == 'table':
         col_en, col_cn = 'Table Name', '表中文名'
     else:
         col_en, col_cn = 'Column Name', '字段中文名'
 
-    # 1. 健壮性检查
     if col_en not in df.columns or col_cn not in df.columns:
-        print(f"⚠️ 跳过：输入文件中找不到列 {col_en} 或 {col_cn}")
-        return df
+        print(f"❌ 列名错误：文件中必须包含 '{col_en}' 和 '{col_cn}'")
+        return
 
-    # 2. 高效去重 (Deduplication)
-    # 400万行数据中，其实只有几万个唯一的单词组合，去重后计算极快
+    # 1. 高效去重
+    print(f"   - 原始数据: {len(df)} 行")
     df[col_en] = df[col_en].fillna("")
     df[col_cn] = df[col_cn].fillna("")
     
     unique_pairs = df[[col_en, col_cn]].drop_duplicates().reset_index(drop=True)
-    print(f"  - 数据压缩: {len(df)} 行 -> {len(unique_pairs)} 个唯一组合")
-    
-    # 3. 预处理
-    processed_en_list = [preprocess_text(x) for x in unique_pairs[col_en]]
-    raw_cn_list = unique_pairs[col_cn].tolist()
-    
-    # 4. 向量化计算 (Vectorization)
-    print("  - 正在进行语义向量计算 (这可能需要几分钟)...")
-    # normalize_embeddings=True 之后，点积就是余弦相似度
-    embeddings_en = model.encode(processed_en_list, batch_size=BATCH_SIZE, normalize_embeddings=True, show_progress_bar=True)
-    embeddings_cn = model.encode(raw_cn_list, batch_size=BATCH_SIZE, normalize_embeddings=True, show_progress_bar=True)
-    
-    # 5. 计算基础分 (Cosine Similarity)
-    print("  - 计算基础语义得分...")
+    print(f"   - 去重后需计算: {len(unique_pairs)} 行")
+
+    # 2. 向量化
+    processed_en = [preprocess_text(x) for x in unique_pairs[col_en]]
+    raw_cn = unique_pairs[col_cn].tolist()
+
+    print("   - 正在计算 AI 语义向量 (CPU)...")
+    embeddings_en = model.encode(processed_en, batch_size=BATCH_SIZE, normalize_embeddings=True, show_progress_bar=True)
+    embeddings_cn = model.encode(raw_cn, batch_size=BATCH_SIZE, normalize_embeddings=True, show_progress_bar=True)
+
+    # 3. 评分
+    print("   - 正在计算综合得分...")
     tensor_en = torch.tensor(embeddings_en)
     tensor_cn = torch.tensor(embeddings_cn)
+    
     cosine_scores = torch.sum(tensor_en * tensor_cn, dim=1)
     base_scores = (torch.clamp(cosine_scores, 0, 1) * 100).int().tolist()
-    
-    # 6. 应用规则修正 (Rule-based Bonus)
-    print("  - 应用行业缩写规则修正...")
+
     final_scores = []
     for i, score in enumerate(base_scores):
         en_raw = unique_pairs.iloc[i][col_en]
         cn_raw = unique_pairs.iloc[i][col_cn]
-        
-        # 计算奖励
-        bonus = check_synonym_bonus(en_raw, cn_raw)
-        
-        # 最终得分 = 基础语义分 + 规则分，封顶 100
-        # 逻辑：如果语义不通(拼音)，base分很低(30)，加了bonus也没用(30+0=30)
-        # 如果语义通(缩写)，base分及格(60)，加bonus变成优秀(85)
-        final_score = min(score + bonus, 100)
-        final_scores.append(final_score)
-        
+        bonus = get_synonym_bonus(en_raw, cn_raw)
+        final_scores.append(min(score + bonus, 100))
+
     unique_pairs['calc_score'] = final_scores
-    
-    # 7. 结果映射还原 (Mapping)
-    print("  - 正在将结果映射回原始数据...")
+
+    # 4. 还原保存
     if '关联度' in df.columns:
         df = df.drop(columns=['关联度'])
         
     result_df = pd.merge(df, unique_pairs, on=[col_en, col_cn], how='left')
     result_df = result_df.rename(columns={'calc_score': '关联度'})
     
-    return result_df
+    result_df.to_csv(file_out, index=False, encoding='utf-8-sig')
+    print(f"✅ 完成！已保存: {file_out}")
 
-# ================= 4. 主程序入口 =================
+# ================= 5. 主程序入口 =================
 
 def main():
-    # 1. 准备模型
-    download_model_if_needed()
-    
-    print(f"\n正在加载模型: {LOCAL_MODEL_DIR} (CPU模式)...")
-    # 加载本地模型
-    model = SentenceTransformer(LOCAL_MODEL_DIR, device='cpu')
-    
-    # 2. 处理表清单
-    if os.path.exists(TABLE_FILE_IN):
-        # 使用 read_csv 读取大数据量
-        df_table = pd.read_csv(TABLE_FILE_IN, dtype=str)
-        df_table_result = calculate_and_fill(df_table, 'table', model)
-        df_table_result.to_csv(TABLE_FILE_OUT, index=False, encoding='utf-8-sig')
-        print(f"✅ 表清单处理完成: {TABLE_FILE_OUT}")
-    else:
-        print(f"⚠️ 未找到文件 {TABLE_FILE_IN}，跳过。")
+    print("="*50)
+    print("      数据治理 AI 映射工具 (官方源兼容版)      ")
+    print("="*50)
 
-    # 3. 处理列清单
-    if os.path.exists(COLUMN_FILE_IN):
-        df_col = pd.read_csv(COLUMN_FILE_IN, dtype=str)
-        df_col_result = calculate_and_fill(df_col, 'column', model)
-        df_col_result.to_csv(COLUMN_FILE_OUT, index=False, encoding='utf-8-sig')
-        print(f"✅ 列清单处理完成: {COLUMN_FILE_OUT}")
-    else:
-        print(f"⚠️ 未找到文件 {COLUMN_FILE_IN}，跳过。")
-        
-    print("\n全部任务完成！")
+    # 1. 下载/检查模型
+    download_model_smartly()
+    
+    # 2. 加载模型
+    print(f"\n正在加载模型: {LOCAL_MODEL_DIR} ...")
+    try:
+        model = SentenceTransformer(LOCAL_MODEL_DIR, device='cpu')
+    except Exception as e:
+        print(f"❌ 模型加载失败: {e}")
+        print("建议：删除目录 ./multilingual-minilm-local 后重试。")
+        return
+
+    # 3. 执行任务
+    process_file(TABLE_FILE_IN, TABLE_FILE_OUT, 'table', model)
+    process_file(COLUMN_FILE_IN, COLUMN_FILE_OUT, 'column', model)
+
+    print("\n🎉 全部结束。")
 
 if __name__ == "__main__":
     main()
